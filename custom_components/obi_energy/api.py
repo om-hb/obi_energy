@@ -262,15 +262,26 @@ class ObiApiClient:
         async with self._login_lock:
             await self._async_login_locked()
 
-    async def _async_refresh_token(self, stale_token: str | None) -> None:
-        """Re-login unless another task already replaced the stale token."""
+    async def _async_handle_unauthorized(self, rejected_token: str | None) -> bool:
+        """React to a 401 for `rejected_token`; return whether to retry.
+
+        The decision is made about the token that was actually rejected, not
+        whatever token is current by the time the 401 arrives. When the
+        backend invalidates a token, concurrent requests (historical poll,
+        live-mode PATCH, WebSocket) all get a 401; the first one logs in
+        again, and the others must simply retry with that new token rather
+        than mistake it for "a fresh token was rejected" and give up.
+        """
         async with self._login_lock:
-            if stale_token is not None and self._token != stale_token:
+            if self._token is not None and self._token != rejected_token:
                 _LOGGER.debug(
-                    "Token was already refreshed by another task; not logging in again"
+                    "Token was already refreshed by another task; retrying with it"
                 )
-                return
+                return True
+            if not self._token_age_allows_refresh():
+                return False
             await self._async_login_locked()
+            return True
 
     def _guard_login_rate(self) -> None:
         """Refuse to send a password login that would be abusive.
@@ -477,12 +488,13 @@ class ObiApiClient:
                     url, headers=headers, params=params, timeout=_REQUEST_TIMEOUT
                 ) as resp:
                     if resp.status == 401:
-                        if attempt == 0 and self._token_age_allows_refresh():
+                        if attempt == 0 and await self._async_handle_unauthorized(
+                            stale_token
+                        ):
                             _LOGGER.debug(
-                                "OBI API returned 401 for %s, refreshing token and retrying",
+                                "OBI API returned 401 for %s, retrying with a refreshed token",
                                 url,
                             )
-                            await self._async_refresh_token(stale_token)
                             continue
                         await _log_http_error(resp, f"OBI request to {url}")
                         raise ObiAuthError("Not authorized after refreshing token")
@@ -611,12 +623,13 @@ class ObiApiClient:
                     if (
                         resp.status == 401
                         and attempt == 0
-                        and self._token_age_allows_refresh()
+                        and await self._async_handle_unauthorized(
+                            headers["Authorization"][7:]
+                        )
                     ):
                         _LOGGER.debug(
-                            "OBI sensor update returned 401, refreshing token and retrying"
+                            "OBI sensor update returned 401, retrying with a refreshed token"
                         )
-                        await self._async_refresh_token(headers["Authorization"][7:])
                         headers["Authorization"] = f"Bearer {self._token}"
                         continue
                     if resp.status in (401, 403):
@@ -704,12 +717,13 @@ class ObiApiClient:
                 if (
                     err.status == 401
                     and attempt == 0
-                    and self._token_age_allows_refresh()
+                    and await self._async_handle_unauthorized(
+                        headers["Authorization"][7:]
+                    )
                 ):
                     _LOGGER.debug(
-                        "OBI live WebSocket returned 401, refreshing token and retrying"
+                        "OBI live WebSocket returned 401, retrying with a refreshed token"
                     )
-                    await self._async_refresh_token(headers["Authorization"][7:])
                     headers["Authorization"] = f"Bearer {self._token}"
                     continue
                 if err.status in (401, 403):
