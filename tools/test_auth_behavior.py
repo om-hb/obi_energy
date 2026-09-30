@@ -37,11 +37,16 @@ import obipkg.api as api  # noqa: E402
 
 LOGINS: list[float] = []
 MODE = {"login": 200, "api": 200}
+# Tokens the backend has invalidated server-side (answered with 401).
+REVOKED: set[str] = set()
+LOGGED_IN = asyncio.Event()
 
 
 def make_jwt(ttl_seconds: int) -> str:
     payload = base64.urlsafe_b64encode(
-        json.dumps({"exp": int(time.time()) + ttl_seconds, "accountId": "x"}).encode()
+        json.dumps(
+            {"exp": int(time.time()) + ttl_seconds, "accountId": "x", "n": len(LOGINS)}
+        ).encode()
     ).decode().rstrip("=")
     return f"header.{payload}.signature"
 
@@ -50,19 +55,34 @@ async def handle_login(request: web.Request) -> web.Response:
     LOGINS.append(time.monotonic())
     if MODE["login"] != 200:
         return web.Response(status=MODE["login"])
+    LOGGED_IN.set()
     return web.json_response({"token": make_jwt(MODE.get("ttl", 19 * 3600))})
 
 
+def _is_revoked(request: web.Request) -> bool:
+    return request.headers.get("Authorization", "")[7:] in REVOKED
+
+
 async def handle_bridges(request: web.Request) -> web.Response:
-    if MODE["api"] != 200:
-        return web.Response(status=MODE["api"])
+    if MODE["api"] != 200 or _is_revoked(request):
+        return web.Response(status=MODE["api"] if MODE["api"] != 200 else 401)
     return web.json_response([{"id": "hh", "sensors": [{"id": "mid"}]}])
+
+
+async def handle_sensor(request: web.Request) -> web.Response:
+    if _is_revoked(request):
+        # Answer only after a concurrent caller has already logged in again,
+        # i.e. the 401 for the old token arrives when a fresh one is current.
+        await LOGGED_IN.wait()
+        return web.json_response({"error": "Invalid token."}, status=401)
+    return web.json_response({"id": "mid", "uploadInterval": 2})
 
 
 async def main() -> None:
     app = web.Application()
     app.router.add_post("/login", handle_login)
     app.router.add_get("/bridges", handle_bridges)
+    app.router.add_patch("/sensors/{mid_id}", handle_sensor)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 8731)
@@ -70,6 +90,7 @@ async def main() -> None:
 
     api.LOGIN_URL = "http://127.0.0.1:8731/login"
     api.BRIDGES_URL = "http://127.0.0.1:8731/bridges"
+    api.SENSOR_URL_TEMPLATE = "http://127.0.0.1:8731/sensors/{mid_id}"
 
     failures = []
 
@@ -157,6 +178,30 @@ async def main() -> None:
             f"logins={len(LOGINS)}",
         )
         MODE["api"] = 200
+
+        # 5b. OBI invalidates a long-lived token server-side while the poll and
+        # the live-mode PATCH are both in flight. The poll logs in again; the
+        # PATCH's late 401 (for the old token) must retry with the new token
+        # instead of mistaking it for "a fresh token was rejected".
+        LOGINS.clear()
+        client = api.ObiApiClient(session, "a@b.de", "pw", 55 * 60)
+        await client.async_get_bridges()
+        client._token_obtained_at -= api.timedelta(hours=1)
+        client._last_login_attempt_at -= api.timedelta(hours=1)
+        REVOKED.add(client._token)
+        LOGGED_IN.clear()
+        results = await asyncio.gather(
+            client.async_set_sensor_upload_interval("mid", 2),
+            client.async_get_bridges(),
+            return_exceptions=True,
+        )
+        errors = [r for r in results if isinstance(r, Exception)]
+        check(
+            "revoked token + concurrent 401s: all callers recover (was: ObiAuthError)",
+            not errors and len(LOGINS) == 2,
+            f"logins={len(LOGINS)} errors={[type(e).__name__ for e in errors]}",
+        )
+        REVOKED.clear()
 
         # 6. Logins per day at the default settings.
         per_day_old = 24 * 60 // 55
