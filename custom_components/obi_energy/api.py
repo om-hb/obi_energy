@@ -63,6 +63,18 @@ _AUTH_BACKOFF_MAX = timedelta(hours=6)
 # A 401 on an API call is only treated as "token expired" if the token is
 # actually old enough for that to be plausible.
 _MIN_TOKEN_AGE_FOR_REFRESH = timedelta(seconds=30)
+# OBI has been seen answering "Invalid token." for a token it had issued only
+# moments before. That is not a credentials problem, so instead of another
+# login the request is retried once with the same token after a short pause.
+_FRESH_TOKEN_RETRY_DELAY = 5
+# If the token is still rejected after that, 401-triggered re-logins are
+# paused with a growing backoff, so a misbehaving backend can never drive a
+# stream of password logins. Any accepted request resets it.
+_TOKEN_REJECT_BACKOFF_INITIAL = timedelta(minutes=5)
+_TOKEN_REJECT_BACKOFF_MAX = timedelta(hours=6)
+# Per request: the original attempt, one retry after a re-login, and one
+# delayed retry with a freshly issued token.
+_MAX_REQUEST_ATTEMPTS = 3
 
 
 class ObiApiError(Exception):
@@ -77,8 +89,24 @@ class ObiConnectionError(ObiApiError):
     """Raised on network or unexpected HTTP errors."""
 
 
+class ObiTokenRejectedError(ObiConnectionError):
+    """Raised when OBI rejects a token even though the login succeeded.
+
+    The password was accepted, so asking the user to re-authenticate would not
+    help; callers treat this like any other transient error and retry later.
+    """
+
+
 class ObiNotFoundError(ObiApiError):
     """Raised when a resource (e.g. /bridges) returns 404."""
+
+
+class _UnauthorizedRetry:
+    """Recovery steps already used by a single request after a 401."""
+
+    def __init__(self) -> None:
+        self.logged_in = False
+        self.waited = False
 
 
 _ISO8601_DURATION_RE = re.compile(
@@ -221,6 +249,9 @@ class ObiApiClient:
         self._last_login_attempt_at: datetime | None = None
         self._auth_failures = 0
         self._auth_blocked_until: datetime | None = None
+        self._token_rejections = 0
+        self._relogin_blocked_until: datetime | None = None
+        self._login_returned_same_token = False
 
     def update_credentials(self, email: str, password: str) -> None:
         """Update the credentials used for future logins."""
@@ -233,6 +264,8 @@ class ObiApiClient:
         self._auth_failures = 0
         self._auth_blocked_until = None
         self._last_login_attempt_at = None
+        self._token_rejections = 0
+        self._relogin_blocked_until = None
 
     def update_login_refresh_interval(self, login_refresh_interval: int) -> None:
         """Update how often the token is proactively refreshed."""
@@ -262,7 +295,9 @@ class ObiApiClient:
         async with self._login_lock:
             await self._async_login_locked()
 
-    async def _async_handle_unauthorized(self, rejected_token: str | None) -> bool:
+    async def _async_handle_unauthorized(
+        self, rejected_token: str | None, retry: _UnauthorizedRetry
+    ) -> bool:
         """React to a 401 for `rejected_token`; return whether to retry.
 
         The decision is made about the token that was actually rejected, not
@@ -271,6 +306,10 @@ class ObiApiClient:
         live-mode PATCH, WebSocket) all get a 401; the first one logs in
         again, and the others must simply retry with that new token rather
         than mistake it for "a fresh token was rejected" and give up.
+
+        A request logs in again at most once, and if a freshly issued token
+        is rejected it is retried once more after a short pause, without
+        another login.
         """
         async with self._login_lock:
             if self._token is not None and self._token != rejected_token:
@@ -278,10 +317,82 @@ class ObiApiClient:
                     "Token was already refreshed by another task; retrying with it"
                 )
                 return True
-            if not self._token_age_allows_refresh():
-                return False
-            await self._async_login_locked()
-            return True
+            token_is_fresh = retry.logged_in or not self._token_age_allows_refresh()
+            if not token_is_fresh:
+                if self._relogin_is_blocked():
+                    return False
+                retry.logged_in = True
+                await self._async_login_locked()
+                return True
+
+        if retry.waited:
+            return False
+        retry.waited = True
+        _LOGGER.debug(
+            "OBI rejected a token issued %ss ago; retrying once in %ss without "
+            "logging in again",
+            self._token_age_seconds(),
+            _FRESH_TOKEN_RETRY_DELAY,
+        )
+        await asyncio.sleep(_FRESH_TOKEN_RETRY_DELAY)
+        return True
+
+    def _relogin_is_blocked(self) -> bool:
+        return (
+            self._relogin_blocked_until is not None
+            and datetime.now(timezone.utc) < self._relogin_blocked_until
+        )
+
+    def _token_age_seconds(self) -> int | None:
+        if self._token_obtained_at is None:
+            return None
+        return int((datetime.now(timezone.utc) - self._token_obtained_at).total_seconds())
+
+    def _note_token_accepted(self) -> None:
+        """Reset the token-rejection backoff after a successful request."""
+        self._token_rejections = 0
+        self._relogin_blocked_until = None
+
+    def _token_rejected(
+        self, context: str, retry: _UnauthorizedRetry
+    ) -> ObiTokenRejectedError:
+        """Log why a 401 could not be recovered from and pause re-logins.
+
+        Never logs the token itself, only facts about it.
+        """
+        error = ObiTokenRejectedError(f"{context} was rejected with HTTP 401")
+        if not (retry.logged_in or retry.waited):
+            # Re-logins are already paused; nothing new was tried, so don't
+            # grow the backoff on every poll that runs into it.
+            _LOGGER.debug(
+                "%s: OBI rejected the token (HTTP 401); 401-triggered logins are "
+                "paused until %s",
+                context,
+                self._relogin_blocked_until,
+            )
+            return error
+        self._token_rejections += 1
+        backoff = min(
+            _TOKEN_REJECT_BACKOFF_INITIAL * (2 ** (self._token_rejections - 1)),
+            _TOKEN_REJECT_BACKOFF_MAX,
+        )
+        self._relogin_blocked_until = datetime.now(timezone.utc) + backoff
+        _LOGGER.warning(
+            "%s: OBI rejected the token (HTTP 401) although it was issued %ss ago "
+            "(logged in again during this request: %s, retried after a pause: %s, "
+            "last login returned the previous token again: %s, token expires: %s). "
+            "The password was accepted, so this is not a credentials problem; "
+            "pausing 401-triggered logins for %s (rejection #%s).",
+            context,
+            self._token_age_seconds(),
+            retry.logged_in,
+            retry.waited,
+            self._login_returned_same_token,
+            self._token_expires_at.isoformat() if self._token_expires_at else "unknown",
+            backoff,
+            self._token_rejections,
+        )
+        return error
 
     def _guard_login_rate(self) -> None:
         """Refuse to send a password login that would be abusive.
@@ -433,6 +544,11 @@ class ObiApiClient:
             _LOGGER.error("OBI login response did not contain a token")
             raise ObiAuthError("Login response did not contain a token")
 
+        self._login_returned_same_token = token == self._token
+        if self._login_returned_same_token:
+            _LOGGER.warning(
+                "OBI login returned the same token that was already in use"
+            )
         self._token = token
         self._token_obtained_at = datetime.now(timezone.utc)
         self._token_expires_at = _jwt_expiry(token)
@@ -480,7 +596,8 @@ class ObiApiClient:
     ) -> Any:
         await self._ensure_logged_in()
 
-        for attempt in range(2):
+        retry = _UnauthorizedRetry()
+        for attempt in range(_MAX_REQUEST_ATTEMPTS):
             headers = self._api_headers(accept)
             stale_token = self._token
             try:
@@ -488,16 +605,16 @@ class ObiApiClient:
                     url, headers=headers, params=params, timeout=_REQUEST_TIMEOUT
                 ) as resp:
                     if resp.status == 401:
-                        if attempt == 0 and await self._async_handle_unauthorized(
-                            stale_token
+                        if (
+                            attempt < _MAX_REQUEST_ATTEMPTS - 1
+                            and await self._async_handle_unauthorized(stale_token, retry)
                         ):
                             _LOGGER.debug(
-                                "OBI API returned 401 for %s, retrying with a refreshed token",
-                                url,
+                                "OBI API returned 401 for %s, retrying", url
                             )
                             continue
                         await _log_http_error(resp, f"OBI request to {url}")
-                        raise ObiAuthError("Not authorized after refreshing token")
+                        raise self._token_rejected(f"OBI request to {url}", retry)
                     if resp.status == 404:
                         _LOGGER.warning("OBI resource not found (HTTP 404): %s", url)
                         raise ObiNotFoundError(f"Resource not found: {url}")
@@ -506,6 +623,7 @@ class ObiApiClient:
                         raise ObiConnectionError(
                             f"Request to {url} failed with HTTP {resp.status}"
                         )
+                    self._note_token_accepted()
                     try:
                         return await resp.json(content_type=None)
                     except ValueError as err:
@@ -535,7 +653,7 @@ class ObiApiClient:
                 _LOGGER.error("Network error requesting %s: %s", url, err)
                 raise ObiConnectionError(f"Network error requesting {url}") from err
 
-        raise ObiAuthError("Not authorized after refreshing token")
+        raise ObiTokenRejectedError(f"OBI request to {url} was rejected with HTTP 401")
 
     def _token_age_allows_refresh(self) -> bool:
         """Return whether a 401 can plausibly mean "token expired".
@@ -612,7 +730,8 @@ class ObiApiClient:
             "X-Lib-Version": "26.6.9",
         }
 
-        for attempt in range(2):
+        retry = _UnauthorizedRetry()
+        for attempt in range(_MAX_REQUEST_ATTEMPTS):
             try:
                 async with self._session.patch(
                     url,
@@ -620,19 +739,19 @@ class ObiApiClient:
                     headers=headers,
                     timeout=_REQUEST_TIMEOUT,
                 ) as resp:
-                    if (
-                        resp.status == 401
-                        and attempt == 0
-                        and await self._async_handle_unauthorized(
-                            headers["Authorization"][7:]
-                        )
-                    ):
-                        _LOGGER.debug(
-                            "OBI sensor update returned 401, retrying with a refreshed token"
-                        )
-                        headers["Authorization"] = f"Bearer {self._token}"
-                        continue
-                    if resp.status in (401, 403):
+                    if resp.status == 401:
+                        if (
+                            attempt < _MAX_REQUEST_ATTEMPTS - 1
+                            and await self._async_handle_unauthorized(
+                                headers["Authorization"][7:], retry
+                            )
+                        ):
+                            _LOGGER.debug("OBI sensor update returned 401, retrying")
+                            headers["Authorization"] = f"Bearer {self._token}"
+                            continue
+                        await _log_http_error(resp, f"OBI sensor update to {url}")
+                        raise self._token_rejected(f"OBI sensor update to {url}", retry)
+                    if resp.status == 403:
                         await _log_http_error(resp, f"OBI sensor update to {url}")
                         raise ObiAuthError(
                             f"Sensor update failed with HTTP {resp.status}"
@@ -665,6 +784,7 @@ class ObiApiClient:
                         raise ObiConnectionError(
                             "Unexpected response format for sensor update"
                         )
+                    self._note_token_accepted()
                     return data
             except aiohttp.ClientConnectorDNSError as err:
                 _LOGGER.error("DNS resolution failed updating %s: %s", url, err)
@@ -682,7 +802,7 @@ class ObiApiClient:
                 _LOGGER.error("Network error updating %s: %s", url, err)
                 raise ObiConnectionError(f"Network error updating {url}") from err
 
-        raise ObiAuthError("Sensor update was not authorized after refreshing token")
+        raise ObiTokenRejectedError(f"OBI sensor update to {url} was rejected with HTTP 401")
 
     async def async_connect_live_data(
         self, hh_id: str, mid_id: str
@@ -703,9 +823,10 @@ class ObiApiClient:
             "X-Lib-Version": "26.6.9",
         }
 
-        for attempt in range(2):
+        retry = _UnauthorizedRetry()
+        for attempt in range(_MAX_REQUEST_ATTEMPTS):
             try:
-                return await self._session.ws_connect(
+                websocket = await self._session.ws_connect(
                     LIVE_DATA_URL,
                     params=params,
                     headers=headers,
@@ -713,20 +834,21 @@ class ObiApiClient:
                     heartbeat=30,
                     compress=15,
                 )
+                self._note_token_accepted()
+                return websocket
             except aiohttp.WSServerHandshakeError as err:
-                if (
-                    err.status == 401
-                    and attempt == 0
-                    and await self._async_handle_unauthorized(
-                        headers["Authorization"][7:]
-                    )
-                ):
-                    _LOGGER.debug(
-                        "OBI live WebSocket returned 401, retrying with a refreshed token"
-                    )
-                    headers["Authorization"] = f"Bearer {self._token}"
-                    continue
-                if err.status in (401, 403):
+                if err.status == 401:
+                    if (
+                        attempt < _MAX_REQUEST_ATTEMPTS - 1
+                        and await self._async_handle_unauthorized(
+                            headers["Authorization"][7:], retry
+                        )
+                    ):
+                        _LOGGER.debug("OBI live WebSocket returned 401, retrying")
+                        headers["Authorization"] = f"Bearer {self._token}"
+                        continue
+                    raise self._token_rejected("OBI live WebSocket", retry) from err
+                if err.status == 403:
                     _LOGGER.error(
                         "OBI live WebSocket authorization failed with HTTP %s",
                         err.status,
@@ -765,4 +887,4 @@ class ObiApiClient:
                 _LOGGER.error("Network error on OBI live WebSocket: %s", err)
                 raise ObiConnectionError("Network error during OBI live WebSocket") from err
 
-        raise ObiAuthError("Live WebSocket was not authorized after refreshing token")
+        raise ObiTokenRejectedError("OBI live WebSocket was rejected with HTTP 401")
