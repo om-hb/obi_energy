@@ -229,6 +229,7 @@ class ObiEnergyCoordinator(DataUpdateCoordinator[ObiEnergyData]):
                     self.hh_id, self.mid_id
                 )
                 _LOGGER.debug("OBI live WebSocket connected")
+                connected_at = datetime.now(timezone.utc)
                 reconnect_delay = _LIVE_RECONNECT_DELAY
                 self._set_live_connection_state(connected=True, error=None)
                 try:
@@ -247,6 +248,17 @@ class ObiEnergyCoordinator(DataUpdateCoordinator[ObiEnergyData]):
                             )
                             break
                 finally:
+                    # Record who ended the connection and how: a close code
+                    # means the server (or aiohttp's heartbeat, 1006) closed
+                    # it; None means we left the loop ourselves.
+                    _LOGGER.debug(
+                        "OBI live WebSocket closed after %ss (close code: %s, "
+                        "error: %s, stopped by integration: %s)",
+                        int((datetime.now(timezone.utc) - connected_at).total_seconds()),
+                        websocket.close_code,
+                        websocket.exception(),
+                        self._live_stop.is_set(),
+                    )
                     self._set_live_connection_state(connected=False)
                     await websocket.close()
             except ObiAuthError as err:
